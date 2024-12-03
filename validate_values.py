@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import glob
 
 def add_helm_repo(repo_name, repo_url):
     try:
@@ -25,7 +26,6 @@ def add_helm_repo(repo_name, repo_url):
 def fetch_chart(repo_name, chart_name, target_dir):
     try:
         print(f"Pulling chart '{repo_name}/{chart_name}'...")
-        # Pull the chart
         subprocess.run(
             ["helm", "pull", f"{repo_name}/{chart_name}", "--untar", "--untardir", target_dir],
             check=True,
@@ -49,17 +49,45 @@ def fetch_chart(repo_name, chart_name, target_dir):
         print(f"Error processing chart: {str(e)}")
         sys.exit(1)
 
-def validate_with_helm_plugin(chart_path, values_file, namespace="default"):
-    try:        
+def prepare_values_files():
+    work_dir = "/tmp/ordered-values"
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir)
+    os.makedirs(work_dir)
+    
+    mounted_files = glob.glob("/values-*")
+    if not mounted_files:
+        print("Error: No values files found. Mount your values files as /values-0, /values-1, etc.")
+        sys.exit(1)
+    
+    mounted_files.sort(key=lambda x: int(x.split('-')[1]))
+    
+    ordered_files = []
+    for i, src in enumerate(mounted_files):
+        if not os.path.exists(src):
+            print(f"Error: Expected values file not found at {src}")
+            sys.exit(1)
+        
+        dst = os.path.join(work_dir, f"{i:02d}-values.yaml")
+        shutil.copy2(src, dst)
+        ordered_files.append(dst)
+    
+    print("\nValues files (in merge order):")
+    for f in ordered_files:
+        print(f"  - {os.path.basename(f)} (from {mounted_files[int(f.split('/')[-1][:2])]})")
+    
+    return ordered_files
+
+def validate_with_helm_plugin(chart_path, values_files, namespace="default"):
+    try:
         print(f"\nRunning validation...")
+        cmd = ["helm", "kubeconform", "--namespace", namespace, "--verbose", "--summary"]
+        for values_file in values_files:
+            cmd.extend(["-f", values_file])
+        cmd.append(chart_path)
+        
         result = subprocess.run(
-            [
-                "helm", "kubeconform",
-                "--namespace", namespace,
-                "-f", values_file,
-                "--verbose", "--summary",
-                chart_path
-            ],
+            cmd,
             check=True,
             capture_output=True
         )
@@ -69,11 +97,6 @@ def validate_with_helm_plugin(chart_path, values_file, namespace="default"):
         sys.exit(1)
 
 def main():
-    values_yaml = "/values.yaml"
-    if not os.path.exists(values_yaml):
-        print(f"Error: values.yaml file not found at {values_yaml}. Please mount your values file to /values.yaml")
-        sys.exit(1)
-
     if len(sys.argv) < 2:
         print("""
 Usage: 
@@ -81,6 +104,12 @@ Usage:
         python validate_values.py --local <helm-chart-path>
     For remote charts:
         python validate_values.py --remote <repo-name> <repo-url> <chart-name>
+        
+Mount your values files in order using:
+    -v ./first.yaml:/values-0
+    -v ./second.yaml:/values-1
+    -v ./third.yaml:/values-2
+    etc.
         
 Example:
     Local:  python validate_values.py --local /chart
@@ -109,13 +138,11 @@ Example:
         repo_url = sys.argv[3]
         chart_name = sys.argv[4]
 
-        print(f"Adding Helm repository '{repo_name}' from {repo_url}...")
         add_helm_repo(repo_name, repo_url)
         
         chart_dir = "/tmp/helm-charts"
         os.makedirs(chart_dir, exist_ok=True)
         
-        print(f"Fetching chart '{chart_name}' from repository...")
         helm_chart_path = fetch_chart(repo_name, chart_name, chart_dir)
         
         if not os.path.exists(helm_chart_path):
@@ -127,8 +154,10 @@ Example:
         print(f"Error: Invalid mode '{mode}'. Use --local or --remote")
         sys.exit(1)
 
-    print(f"Validating Helm chart at '{helm_chart_path}' with values file '{values_yaml}'...")
-    validate_with_helm_plugin(helm_chart_path, values_yaml)
+    values_files = prepare_values_files()
+    
+    print(f"\nValidating Helm chart at '{helm_chart_path}'...")
+    validate_with_helm_plugin(helm_chart_path, values_files)
     print("Validation completed successfully!")
 
 if __name__ == "__main__":
